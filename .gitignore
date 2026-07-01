@@ -158,6 +158,9 @@ opencode.json
 # Codex
 .codex/
 
+# Cursor
+.cursor/
+
 # Bob
 .bob/
 
