@@ -481,6 +481,7 @@ program
   .description('Archive a completed change and update main specs')
   .option('-y, --yes', 'Skip confirmation prompts')
   .option('--skip-specs', 'Skip spec update operations (useful for infrastructure, tooling, or doc-only changes)')
+  .option('--prepared-specs <json-file>', 'Apply verified complete specs from a preparation manifest')
   .option('--no-validate', 'Skip validation (not recommended, requires confirmation)')
   .option('--json', 'Output as JSON (non-interactive)')
   .option('--store <id>', STORE_OPTION_DESCRIPTION)

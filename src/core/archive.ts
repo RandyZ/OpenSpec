@@ -178,6 +178,7 @@ async function listActiveChangeNames(changesDir: string): Promise<string[]> {
 export interface ArchiveOptions {
   yes?: boolean;
   skipSpecs?: boolean;
+  preparedSpecs?: string;
   noValidate?: boolean;
   validate?: boolean;
   json?: boolean;
@@ -286,7 +287,11 @@ function describeChangeName(name: string): string {
 function rerunFlags(options: ArchiveOptions): string[] {
   return [
     ...(options.skipSpecs ? ['--skip-specs'] : []),
+    ...(options.preparedSpecs !== undefined
+      ? ['--prepared-specs', quoteForShell(options.preparedSpecs) ?? '<json-file>']
+      : []),
     ...(options.validate === false || options.noValidate === true ? ['--no-validate'] : []),
+    ...(options.json ? ['--json'] : []),
     '--yes',
   ];
 }
@@ -674,6 +679,98 @@ interface SpecMutation {
   update: SpecUpdate;
   outcome: 'write' | 'retire';
   rebuilt: string;
+}
+
+interface PreparedSpec {
+  capability: string;
+  deltaSha256: string;
+  baseSha256: string | null;
+  content: string;
+}
+
+function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+async function assertNoSymlinkComponents(root: string, file: string): Promise<void> {
+  const relative = path.relative(root, file);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Prepared spec path is outside the OpenSpec root: ${file}`);
+  }
+  let current = root;
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (stat?.isSymbolicLink()) throw new Error(`Prepared spec path contains a symbolic link: ${current}`);
+  }
+}
+
+async function readPreparedSpecs(
+  file: string,
+  root: ResolvedOpenSpecRoot,
+  changeName: string,
+  changeDir: string,
+  updates: SpecUpdate[]
+): Promise<Map<string, PreparedSpec>> {
+  if ((await fs.lstat(file)).isSymbolicLink()) {
+    throw new Error('Prepared spec manifest must not be a symbolic link.');
+  }
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(await fs.readFile(file, 'utf8'));
+  } catch {
+    throw new Error('Prepared spec manifest is not valid JSON.');
+  }
+  if (
+    typeof manifest !== 'object' || manifest === null || Array.isArray(manifest) ||
+    !exactKeys(manifest as Record<string, unknown>, ['formatVersion', 'root', 'change', 'specs'])
+  ) {
+    throw new Error('Prepared spec manifest has unexpected or missing fields.');
+  }
+  const value = manifest as Record<string, unknown>;
+  if (value.formatVersion !== 1 || value.root !== root.path || value.change !== changeName || !Array.isArray(value.specs)) {
+    throw new Error('Prepared spec manifest version, root, change, or specs do not match this archive.');
+  }
+  const expected = new Set(updates.map(({ id }) => id));
+  const specs = new Map<string, PreparedSpec>();
+  for (const raw of value.specs) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw) ||
+      !exactKeys(raw as Record<string, unknown>, ['capability', 'deltaSha256', 'baseSha256', 'content'])) {
+      throw new Error('Prepared spec entry has unexpected or missing fields.');
+    }
+    const spec = raw as PreparedSpec;
+    if (
+      typeof spec.capability !== 'string' || !expected.has(spec.capability) || specs.has(spec.capability) ||
+      typeof spec.deltaSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(spec.deltaSha256) ||
+      (spec.baseSha256 !== null && (typeof spec.baseSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(spec.baseSha256))) ||
+      typeof spec.content !== 'string'
+    ) {
+      throw new Error('Prepared spec has a duplicate or unknown capability, invalid hash, or invalid content.');
+    }
+    specs.set(spec.capability, spec);
+  }
+  if (specs.size !== expected.size) throw new Error('Prepared spec manifest does not cover every delta capability.');
+
+  for (const update of updates) {
+    const source = path.join(changeDir, 'specs', ...update.id.split('/'), 'spec.md');
+    const target = path.join(root.specsDir, ...update.id.split('/'), 'spec.md');
+    await assertNoSymlinkComponents(root.path, source);
+    await assertNoSymlinkComponents(root.path, target);
+    const spec = specs.get(update.id)!;
+    const deltaHash = createHash('sha256').update(await fs.readFile(source)).digest('hex');
+    const base = await fs.readFile(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    const baseHash = base === null ? null : createHash('sha256').update(base).digest('hex');
+    if (deltaHash !== spec.deltaSha256 || baseHash !== spec.baseSha256) {
+      throw new Error(`Prepared spec inputs for '${update.id}' changed since preparation.`);
+    }
+  }
+  return specs;
 }
 
 function statIdentity(value: {
@@ -1118,6 +1215,14 @@ export class ArchiveCommand {
     const changesDir = root.changesDir;
     const archiveDir = root.archiveDir;
     const mainSpecsDir = root.specsDir;
+    const preparedSpecsFile = options.preparedSpecs;
+    if (preparedSpecsFile !== undefined &&
+      (typeof preparedSpecsFile !== 'string' || preparedSpecsFile.trim() === '')) {
+      throw new ArchiveBlockedError(
+        'archive_prepared_specs_path_invalid',
+        '--prepared-specs requires a non-empty JSON filename.'
+      );
+    }
 
     for (const [allowedDirectory, managedDir] of [
       [root.path, changesDir],
@@ -1140,7 +1245,7 @@ export class ArchiveCommand {
         throw new ArchiveBlockedError(
           'archive_change_name_required',
           'A change name is required: archive --json is non-interactive.',
-          withStoreFlag(root, 'openspec archive <change-name> --json')
+          withStoreFlag(root, `openspec archive <change-name> ${rerunFlags(options).join(' ')}`)
         );
       }
       const selectedChange = await this.selectChange(changesDir, root, options);
@@ -1157,6 +1262,13 @@ export class ArchiveCommand {
     }
 
     const changeDir = path.join(changesDir, changeName);
+
+    if (preparedSpecsFile !== undefined && (options.skipSpecs || options.noValidate || options.validate === false)) {
+      throw new ArchiveBlockedError(
+        'archive_prepared_specs_conflict',
+        '--prepared-specs cannot be combined with --skip-specs or --no-validate.'
+      );
+    }
 
     // Verify change exists
     try {
@@ -1413,6 +1525,12 @@ export class ArchiveCommand {
     // can never authorise a deletion.
     const retirementMarker = readRetireCapabilitiesMarker(changeDir);
     const retirementDeclared = retirementMarker.declared;
+    if (preparedSpecsFile !== undefined && retirementDeclared) {
+      throw new ArchiveBlockedError(
+        'archive_prepared_specs_retirement',
+        'Prepared specs cannot retire or delete a capability.'
+      );
+    }
     const retirementAuthorizationFingerprint = retirementDeclared
       ? await fingerprintPortableContent(path.join(changeDir, METADATA_FILENAME))
       : undefined;
@@ -1435,6 +1553,18 @@ export class ArchiveCommand {
     } else {
       // Find specs to update
       const specUpdates = await findSpecUpdates(changeDir, mainSpecsDir);
+      if (preparedSpecsFile !== undefined && specUpdates.length === 0) {
+        throw new ArchiveBlockedError('archive_prepared_specs_empty', 'Prepared specs require at least one delta capability.');
+      }
+      const preparedManifestFingerprint = preparedSpecsFile !== undefined
+        ? await fingerprintPath(preparedSpecsFile)
+        : undefined;
+      const preparedSpecs = preparedSpecsFile !== undefined
+        ? await readPreparedSpecs(preparedSpecsFile, root, changeName!, changeDir, specUpdates)
+        : undefined;
+      if (preparedSpecsFile !== undefined && (await fingerprintPath(preparedSpecsFile)) !== preparedManifestFingerprint) {
+        throw new Error('Prepared spec manifest changed while archive was reading it.');
+      }
 
       if (specUpdates.length > 0) {
         if (!json) {
@@ -1460,12 +1590,50 @@ export class ArchiveCommand {
           sourceContentFingerprint: string;
           targetFingerprint: string;
           targetMovableFingerprint: string;
+          needsWrite: boolean;
         }> = [];
         let prepareError: unknown;
         try {
           for (const update of specUpdates) {
             const sourceBeforeBuild = await fingerprintPath(update.source);
             const targetBeforeBuild = await fingerprintPath(update.target);
+            if (preparedSpecs) {
+              const source = path.join(changeDir, 'specs', ...update.id.split('/'), 'spec.md');
+              const target = path.join(root.specsDir, ...update.id.split('/'), 'spec.md');
+              await assertNoSymlinkComponents(root.path, source);
+              await assertNoSymlinkComponents(root.path, target);
+              const expected = preparedSpecs.get(update.id)!;
+              const deltaHash = createHash('sha256').update(await fs.readFile(update.source)).digest('hex');
+              const base = await fs.readFile(update.target).catch((error: NodeJS.ErrnoException) => {
+                if (error.code === 'ENOENT') return null;
+                throw error;
+              });
+              const baseHash = base === null ? null : createHash('sha256').update(base).digest('hex');
+              if (deltaHash !== expected.deltaSha256 || baseHash !== expected.baseSha256) {
+                throw new Error(`Prepared spec inputs for '${update.id}' changed while archive was preparing.`);
+              }
+              const content = preparedSpecs.get(update.id)!.content;
+              const needsWrite = base === null || !base.equals(Buffer.from(content));
+              const sourceAfterBuild = await fingerprintPath(update.source);
+              const targetAfterBuild = await fingerprintPath(update.target);
+              if (sourceBeforeBuild !== sourceAfterBuild || targetBeforeBuild !== targetAfterBuild) {
+                throw new Error(`Spec inputs for '${update.id}' changed while archive was preparing the preview.`);
+              }
+              prepared.push({
+                update,
+                rebuilt: content,
+                counts: { added: 0, modified: 0, removed: 0, renamed: 0 },
+                outcome: 'write',
+                noRequirementBlocks: false,
+                unaccountedContent: [],
+                sourceFingerprint: sourceAfterBuild,
+                sourceContentFingerprint: await fingerprintPortableContent(update.source),
+                targetFingerprint: targetAfterBuild,
+                targetMovableFingerprint: await fingerprintMovablePath(update.target),
+                needsWrite,
+              });
+              continue;
+            }
             const built = await buildUpdatedSpec(update, changeName!, { silent: true });
             const sourceAfterBuild = await fingerprintPath(update.source);
             const targetAfterBuild = await fingerprintPath(update.target);
@@ -1493,6 +1661,7 @@ export class ArchiveCommand {
               sourceContentFingerprint: await fingerprintPortableContent(update.source),
               targetFingerprint: targetAfterBuild,
               targetMovableFingerprint: await fingerprintMovablePath(update.target),
+              needsWrite: built.counts.added + built.counts.modified + built.counts.removed + built.counts.renamed > 0,
             });
             specWarnings.push(...built.warnings);
           }
@@ -1506,6 +1675,13 @@ export class ArchiveCommand {
             console.log(chalk.yellow(`⚠️  Warning: ${warning}`));
           }
         }
+        if (preparedSpecs && prepareError !== undefined) {
+          throw new ArchiveBlockedError(
+            'archive_spec_update_failed',
+            prepareError instanceof Error ? prepareError.message : String(prepareError),
+            'Fix the prepared spec inputs and rerun. No files were changed.'
+          );
+        }
 
         let shouldUpdateSpecs = true;
         if (!options.yes) {
@@ -1513,7 +1689,7 @@ export class ArchiveCommand {
             throw new ArchiveBlockedError(
               'archive_confirmation_required',
               `Updating ${specUpdates.length} spec(s) requires confirmation: rerun with --yes.`,
-              withStoreFlag(root, 'openspec archive <change-name> --json --yes')
+              rerunCommand(root, changeName!, options)
             );
           }
           shouldUpdateSpecs = await confirmOrBlock(
@@ -1529,6 +1705,12 @@ export class ArchiveCommand {
               )
           );
           if (!shouldUpdateSpecs) {
+            if (preparedSpecs) {
+              throw new ArchiveBlockedError(
+                'archive_prepared_specs_required',
+                'Prepared specs must be applied before this change can be archived.'
+              );
+            }
             console.log('Skipping spec updates. Proceeding with archive.');
           }
         }
@@ -1540,6 +1722,10 @@ export class ArchiveCommand {
           // delete a requirement added while the prompt was waiting.
           if (prepareError === undefined) {
             try {
+              if (preparedSpecsFile !== undefined &&
+                (await fingerprintPath(preparedSpecsFile)) !== preparedManifestFingerprint) {
+                throw new Error('Prepared spec manifest changed while archive was awaiting confirmation.');
+              }
               const currentRetirementMarker = readRetireCapabilitiesMarker(changeDir);
               if (
                 currentRetirementMarker.declared !== retirementMarker.declared ||
@@ -1570,6 +1756,7 @@ export class ArchiveCommand {
                       'No files were changed; review the new content and rerun.'
                   );
                 }
+                if (preparedSpecs) continue;
                 const rebuilt = await buildUpdatedSpec(current, changeName!, { silent: true });
                 const outcome = await decideSpecOutcome(
                   current,
@@ -1720,10 +1907,9 @@ export class ArchiveCommand {
           await assertArchiveDestinationAvailable(archivePath, archiveName);
           const mutations = prepared
             .filter(
-              ({ outcome, counts }) =>
+              ({ outcome, needsWrite }) =>
                 outcome === 'retire' ||
-                (outcome === 'write' &&
-                  counts.added + counts.modified + counts.removed + counts.renamed > 0)
+                (outcome === 'write' && needsWrite)
             )
             .map(({ update, outcome, rebuilt }) => ({
               update,
@@ -1757,7 +1943,7 @@ export class ArchiveCommand {
             // Deletions are deferred to the loop below.
             if (p.outcome !== 'write') continue;
             const { added, modified, removed, renamed } = p.counts;
-            if (added + modified + removed + renamed === 0) {
+            if (!p.needsWrite) {
               // Every operation was already synced: rewriting the file would
               // only churn normalization differences into it.
               continue;
@@ -1765,6 +1951,12 @@ export class ArchiveCommand {
             await writeUpdatedSpec(p.update, p.rebuilt, p.counts, {
               silent: json,
               beforeMutate: async () => {
+                if (preparedSpecs) {
+                  await assertNoSymlinkComponents(
+                    root.path,
+                    path.join(root.specsDir, ...p.update.id.split('/'), 'spec.md')
+                  );
+                }
                 if (
                   (await fingerprintSpecInputs(p.update)) !==
                   `${p.sourceFingerprint}\n${p.targetFingerprint}`
@@ -1914,7 +2106,7 @@ export class ArchiveCommand {
             }
 
             specsUpdated = wroteAny;
-            totals = writeTotals;
+            totals = preparedSpecs ? undefined : writeTotals;
             if (!json) {
             console.log(
               `Totals: + ${writeTotals.added}, ~ ${writeTotals.modified}, - ${writeTotals.removed}, → ${writeTotals.renamed}`
@@ -1935,6 +2127,14 @@ export class ArchiveCommand {
                   `The delta for '${proposed.update.id}' changed before the change could be archived.`
                 );
               }
+              if (preparedSpecs && !proposed.needsWrite &&
+                (await fingerprintPath(proposed.update.target)) !== proposed.targetFingerprint) {
+                throw new Error(`Main spec '${proposed.update.id}' changed before the change could be archived.`);
+              }
+            }
+            if (preparedSpecsFile !== undefined &&
+              (await fingerprintPath(preparedSpecsFile)) !== preparedManifestFingerprint) {
+              throw new Error('Prepared spec manifest changed before the change could be archived.');
             }
             if (hasRetirements) {
               await assertRetirementAuthorization(

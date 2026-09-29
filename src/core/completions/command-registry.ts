@@ -181,6 +181,11 @@ export const COMMAND_REGISTRY: CommandDefinition[] = [
         description: 'Skip spec update operations',
       },
       {
+        name: 'prepared-specs',
+        takesValue: true,
+        description: 'Apply verified complete specs from a preparation manifest',
+      },
+      {
         name: 'no-validate',
         description: 'Skip validation (not recommended)',
       },

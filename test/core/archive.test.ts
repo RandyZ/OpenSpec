@@ -6,6 +6,7 @@ import { MarkdownParser } from '../../src/core/parsers/markdown-parser.js';
 import { findMainSpecStructureIssues } from '../../src/core/parsers/spec-structure.js';
 import { VALIDATION_MESSAGES } from '../../src/core/validation/constants.js';
 import { formatLocalDate } from '../../src/utils/date.js';
+import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
@@ -23,6 +24,7 @@ vi.mock('@inquirer/prompts', () => ({
 vi.mock('../../src/utils/interactive.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/utils/interactive.js')>();
   return { ...actual, confirmPrompt: vi.fn() };
+
 });
 
 describe('ArchiveCommand', () => {
@@ -8280,6 +8282,277 @@ This change exists to document greeting behavior thoroughly for the team, which 
         '## Purpose\nLets users assemble widgets from parts in a repeatable way.'
       );
       expect(mainSpec).toContain('### Requirement: User can build a widget');
+    });
+  });
+  describe('prepared specs archive', () => {
+    const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+    const finalSpec = (name: string, detail = 'prepared') =>
+      `# ${name} Specification\n\n## Purpose\nThe ${name} capability has a complete purpose.\n\n## Requirements\n\n### Requirement: ${name} behavior\nThe system SHALL provide ${detail} behavior.\n\n#### Scenario: It works\n- **WHEN** the capability is used\n- **THEN** it provides ${detail} behavior\n`;
+    const delta = (name: string) =>
+      `## ADDED Requirements\n\n### Requirement: ${name} behavior\nThe system SHALL provide prepared behavior.\n\n#### Scenario: It works\n- **WHEN** the capability is used\n- **THEN** it provides prepared behavior\n`;
+
+    async function fixture(capabilities = ['alpha']) {
+      const change = 'prepared-change';
+      const changeDir = path.join(tempDir, 'openspec', 'changes', change);
+      const specs: Array<{ capability: string; deltaSha256: string; baseSha256: string | null; content: string }> = [];
+      for (const capability of capabilities) {
+        const source = path.join(changeDir, 'specs', capability, 'spec.md');
+        await fs.mkdir(path.dirname(source), { recursive: true });
+        const sourceContent = delta(capability);
+        await fs.writeFile(source, sourceContent);
+        specs.push({
+          capability,
+          deltaSha256: sha256(sourceContent),
+          baseSha256: null,
+          content: finalSpec(capability),
+        });
+      }
+      const manifest = { formatVersion: 1, root: await fs.realpath(tempDir), change, specs };
+      const manifestPath = path.join(tempDir, 'prepared.json');
+      const save = async () => fs.writeFile(manifestPath, JSON.stringify(manifest));
+      await save();
+      const run = async () => {
+        await archiveCommand.execute(change, { yes: true, json: true, preparedSpecs: manifestPath });
+        return JSON.parse(String(vi.mocked(console.log).mock.calls.at(-1)?.[0]));
+      };
+      return { change, changeDir, manifest, manifestPath, save, run };
+    }
+
+    it('writes complete content and returns the existing archive.path shape', async () => {
+      const f = await fixture();
+      const result = await f.run();
+      expect(result.archive.path).toBe(path.join(f.manifest.root, 'openspec', 'changes', 'archive', `${formatLocalDate()}-${f.change}`));
+      expect(await fs.readFile(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'), 'utf8')).toBe(f.manifest.specs[0].content);
+      await expect(fs.access(f.changeDir)).rejects.toThrow();
+    });
+
+    it('does not rewrite an identical main spec', async () => {
+      const f = await fixture();
+      const target = path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md');
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, f.manifest.specs[0].content);
+      f.manifest.specs[0].baseSha256 = sha256(f.manifest.specs[0].content);
+      await f.save();
+      const before = await fs.stat(target);
+      const result = await f.run();
+      expect(result.archive.specsUpdated).toBe(false);
+      expect((await fs.stat(target)).mtimeMs).toBe(before.mtimeMs);
+    });
+
+    it.each([
+      ['invalid JSON', '{'],
+      ['extra field', { extra: true }],
+      ['wrong version', { formatVersion: 2 }],
+      ['wrong root', { root: '/elsewhere' }],
+      ['wrong change', { change: 'other' }],
+      ['missing capability', { specs: [] }],
+      ['unknown capability', { specs: [{ capability: 'unknown', deltaSha256: '0'.repeat(64), baseSha256: null, content: finalSpec('unknown') }] }],
+      ['duplicate capability', { duplicate: true }],
+      ['malformed hash', { specs: [{ capability: 'alpha', deltaSha256: 'bad', baseSha256: null, content: finalSpec('alpha') }] }],
+      ['extra spec field', { specs: [{ capability: 'alpha', deltaSha256: '0'.repeat(64), baseSha256: null, content: finalSpec('alpha'), target: '/tmp/outside' }] }],
+    ])('rejects %s before writing', async (_label, alteration) => {
+      const f = await fixture();
+      if (alteration === '{') await fs.writeFile(f.manifestPath, alteration);
+      else if (typeof alteration === 'object' && 'duplicate' in alteration) {
+        f.manifest.specs.push({ ...f.manifest.specs[0] });
+        await f.save();
+      } else {
+        Object.assign(f.manifest, alteration);
+        await f.save();
+      }
+      const result = await f.run();
+      expect(result.archive).toBeNull();
+      expect(process.exitCode).toBe(1);
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('rejects delta drift and preserves a dirty main spec on base drift', async () => {
+      const f = await fixture();
+      const source = path.join(f.changeDir, 'specs', 'alpha', 'spec.md');
+      await fs.appendFile(source, '\n<!-- dirty -->\n');
+      expect((await f.run()).archive).toBeNull();
+      const target = path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md');
+      await fs.writeFile(source, delta('alpha'));
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      const dirty = finalSpec('alpha', 'dirty');
+      await fs.writeFile(target, dirty);
+      expect((await f.run()).archive).toBeNull();
+      expect(await fs.readFile(target, 'utf8')).toBe(dirty);
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('rejects incompatible flags and retirement content', async () => {
+      const f = await fixture();
+      for (const conflicting of [{ skipSpecs: true }, { noValidate: true }, { validate: false }]) {
+        await archiveCommand.execute(f.change, { yes: true, json: true, preparedSpecs: f.manifestPath, ...conflicting });
+        expect(JSON.parse(String(vi.mocked(console.log).mock.calls.at(-1)?.[0])).archive).toBeNull();
+      }
+      f.manifest.specs[0].content = '# alpha Specification\n\n## Purpose\nRetired entirely.\n';
+      await f.save();
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('rejects an explicitly empty prepared manifest path instead of running ordinary archive', async () => {
+      const f = await fixture();
+      await archiveCommand.execute(f.change, { yes: true, json: true, preparedSpecs: '' });
+      const result = JSON.parse(String(vi.mocked(console.log).mock.calls.at(-1)?.[0]));
+      expect(result.archive).toBeNull();
+      expect(process.exitCode).toBe(1);
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('does not archive when the user declines applying prepared specs', async () => {
+      const f = await fixture();
+      const { confirmPrompt: confirm } = await import('../../src/utils/interactive.js');
+      vi.mocked(confirm).mockResolvedValue(false);
+      onTestFinished(() => vi.mocked(confirm).mockReset());
+
+      await expect(archiveCommand.execute(f.change, { preparedSpecs: f.manifestPath })).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+    });
+
+    it('does not let a declined prompt bypass a prepared preview error', async () => {
+      const f = await fixture();
+      const source = path.join(f.manifest.root, 'openspec', 'changes', f.change, 'specs', 'alpha', 'spec.md');
+      const target = path.join(f.manifest.root, 'openspec', 'specs', 'alpha', 'spec.md');
+      const realRead = fs.readFile.bind(fs);
+      let drifted = false;
+      onTestFinished(() => vi.restoreAllMocks());
+      vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (String(file) === target && !drifted) {
+          try {
+            return await realRead(file, options);
+          } finally {
+            drifted = true;
+            await fs.appendFile(source, '\n<!-- changed after manifest check -->\n');
+          }
+        }
+        return realRead(file, options);
+      });
+      const { confirmPrompt: confirm } = await import('../../src/utils/interactive.js');
+      vi.mocked(confirm).mockResolvedValue(false);
+      onTestFinished(() => vi.mocked(confirm).mockReset());
+
+      await expect(archiveCommand.execute(f.change, { preparedSpecs: f.manifestPath })).rejects.toThrow();
+      expect(drifted).toBe(true);
+      expect(confirm).not.toHaveBeenCalled();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+      await expect(fs.access(target)).rejects.toThrow();
+    });
+
+    it('keeps prepared specs in human and JSON retry hints without unsafe shell text', async () => {
+      const f = await fixture();
+      const { confirmPrompt: confirm } = await import('../../src/utils/interactive.js');
+      vi.mocked(confirm).mockRejectedValue(new Error('User force closed the prompt'));
+      onTestFinished(() => vi.mocked(confirm).mockReset());
+      await expect(archiveCommand.execute(f.change, { preparedSpecs: f.manifestPath })).rejects.toMatchObject({
+        diagnostic: {
+          fix: expect.stringContaining(`--prepared-specs ${f.manifestPath}`),
+        },
+      });
+
+      const unsafe = path.join(tempDir, 'prepared-$(id).json');
+      await fs.rename(f.manifestPath, unsafe);
+      await archiveCommand.execute(f.change, { preparedSpecs: unsafe, json: true });
+      const payload = JSON.parse(String(vi.mocked(console.log).mock.calls.at(-1)?.[0]));
+      expect(payload.status[0].fix).toContain('--prepared-specs <json-file>');
+      expect(payload.status[0].fix).toContain('--json');
+      expect(payload.status[0].fix).not.toContain('$(id)');
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('rejects a symlink target and never writes outside the root', async () => {
+      const f = await fixture();
+      const outside = path.join(tempDir, 'outside');
+      const targetDir = path.join(tempDir, 'openspec', 'specs', 'alpha');
+      await fs.mkdir(outside);
+      await fs.symlink(outside, targetDir, 'dir');
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.access(path.join(outside, 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('rejects symlinked manifest and delta source', async () => {
+      const f = await fixture();
+      const manifestLink = path.join(tempDir, 'prepared-link.json');
+      await fs.symlink(f.manifestPath, manifestLink);
+      await archiveCommand.execute(f.change, { yes: true, json: true, preparedSpecs: manifestLink });
+      expect(JSON.parse(String(vi.mocked(console.log).mock.calls.at(-1)?.[0])).archive).toBeNull();
+
+      const source = path.join(f.changeDir, 'specs', 'alpha', 'spec.md');
+      const outside = path.join(tempDir, 'outside-delta.md');
+      await fs.rename(source, outside);
+      await fs.symlink(outside, source);
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('validates every final spec before writing any of them', async () => {
+      const f = await fixture(['alpha', 'beta']);
+      f.manifest.specs[1].content = '# beta Specification\n\n## Purpose\nNo requirements remain.\n';
+      await f.save();
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('rejects an occupied archive target before a spec write', async () => {
+      const f = await fixture();
+      const occupied = path.join(tempDir, 'openspec', 'changes', 'archive', `${formatLocalDate()}-${f.change}`);
+      await fs.mkdir(occupied);
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+    });
+
+    it('restores prepared specs when another process takes the archive target after preflight', async () => {
+      const f = await fixture();
+      const realRename = fs.rename.bind(fs);
+      const occupied = path.join(tempDir, 'openspec', 'changes', 'archive', `${formatLocalDate()}-${f.change}`);
+      onTestFinished(() => vi.restoreAllMocks());
+      vi.spyOn(fs, 'rename').mockImplementation(async (source, destination) => {
+        if (String(source) === path.join(f.manifest.root, 'openspec', 'changes', f.change)) {
+          await fs.mkdir(occupied, { recursive: true });
+          await fs.writeFile(path.join(occupied, 'squatter.txt'), 'mine now\n');
+        }
+        return realRename(source, destination);
+      });
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.readFile(path.join(occupied, 'squatter.txt'), 'utf8')).resolves.toBe('mine now\n');
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('restores earlier writes when a later write fails', async () => {
+      const f = await fixture(['alpha', 'beta']);
+      const realWrite = fs.writeFile.bind(fs);
+      onTestFinished(() => vi.restoreAllMocks());
+      vi.spyOn(fs, 'writeFile').mockImplementation(async (file, data, options) => {
+        if (String(file).endsWith(`${path.sep}specs${path.sep}beta${path.sep}spec.md`)) {
+          await realWrite(file, data, options);
+          throw new Error('write denied after writing');
+        }
+        return realWrite(file, data, options);
+      });
+      expect((await f.run()).archive).toBeNull();
+      for (const name of ['alpha', 'beta']) await expect(fs.access(path.join(tempDir, 'openspec', 'specs', name, 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
+    it('restores a prepared write when the final move fails', async () => {
+      const f = await fixture();
+      const realRename = fs.rename.bind(fs);
+      onTestFinished(() => vi.restoreAllMocks());
+      vi.spyOn(fs, 'rename').mockImplementation(async (source, destination) => {
+        if (String(source) === path.join(f.manifest.root, 'openspec', 'changes', f.change)) throw Object.assign(new Error('move denied'), { code: 'EACCES' });
+        return realRename(source, destination);
+      });
+      expect((await f.run()).archive).toBeNull();
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
     });
   });
 });
