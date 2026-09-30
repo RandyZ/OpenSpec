@@ -8793,6 +8793,20 @@ This change exists to document greeting behavior thoroughly for the team, which 
       await expect(fs.access(f.changeDir)).rejects.toThrow();
     });
 
+    it('rejects a prepared Purpose placeholder before writing or moving', async () => {
+      const f = await fixture();
+      f.manifest.specs[0].content = f.manifest.specs[0].content.replace(
+        'The alpha capability has a complete purpose.',
+        `TBD - created by archiving change ${f.change}. Update Purpose after archive.`
+      );
+      await f.save();
+
+      expect((await f.run()).archive).toBeNull();
+      expect(process.exitCode).toBe(1);
+      await expect(fs.access(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'))).rejects.toThrow();
+      await expect(fs.access(f.changeDir)).resolves.not.toThrow();
+    });
+
     it('preserves an existing CRLF main spec when applying prepared content', async () => {
       const f = await fixture();
       const target = path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md');

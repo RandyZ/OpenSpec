@@ -2032,6 +2032,19 @@ export class ArchiveCommand {
               if (p.outcome !== 'write') continue;
               const specName = p.update.id;
               const report = await new Validator().validateSpecContent(specName, p.rebuilt);
+              if (preparedSpecs && report.issues.some((issue) => issue.message === VALIDATION_MESSAGES.PURPOSE_IS_PLACEHOLDER)) {
+                const message = `Prepared spec for '${specName}' has a placeholder Purpose. No files were changed.`;
+                if (json) {
+                  throw new ArchiveBlockedError(
+                    'archive_prepared_specs_placeholder_purpose',
+                    message,
+                    'Write a descriptive Purpose in the prepared spec and rerun.'
+                  );
+                }
+                console.log(chalk.red(message));
+                process.exitCode = 1;
+                return null;
+              }
               if (!report.valid) {
                 // This run is what emptied the capability, and "no
                 // requirements" is the only thing wrong with the spec that
