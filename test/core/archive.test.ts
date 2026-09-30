@@ -8793,6 +8793,36 @@ This change exists to document greeting behavior thoroughly for the team, which 
       await expect(fs.access(f.changeDir)).rejects.toThrow();
     });
 
+    it('preserves an existing CRLF main spec when applying prepared content', async () => {
+      const f = await fixture();
+      const target = path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md');
+      const previous = finalSpec('alpha', 'old').replace(/\n/g, '\r\n');
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, previous);
+      f.manifest.specs[0].baseSha256 = sha256(previous);
+      await f.save();
+
+      expect((await f.run()).archive).not.toBeNull();
+      expect(await fs.readFile(target, 'utf8')).toBe(f.manifest.specs[0].content.replace(/\n/g, '\r\n'));
+    });
+
+    it('keeps the prepared archive transaction on the Windows-style EPERM move fallback', async () => {
+      const f = await fixture();
+      const realRename = fs.rename.bind(fs);
+      onTestFinished(() => vi.restoreAllMocks());
+      vi.spyOn(fs, 'rename').mockImplementation(async (source, destination) => {
+        if (String(source) === f.changeDir && String(destination).includes(`${path.sep}changes${path.sep}archive${path.sep}`)) {
+          throw Object.assign(new Error('Windows move denied'), { code: 'EPERM' });
+        }
+        return realRename(source, destination);
+      });
+
+      const result = await f.run();
+      expect(result.archive.path).toBe(path.join(f.manifest.root, 'openspec', 'changes', 'archive', `${formatLocalDate()}-${f.change}`));
+      expect(await fs.readFile(path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md'), 'utf8')).toBe(f.manifest.specs[0].content);
+      await expect(fs.access(f.changeDir)).rejects.toThrow();
+    });
+
     it('does not rewrite an identical main spec', async () => {
       const f = await fixture();
       const target = path.join(tempDir, 'openspec', 'specs', 'alpha', 'spec.md');
